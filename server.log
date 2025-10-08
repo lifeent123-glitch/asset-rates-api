@@ -1,0 +1,2 @@
+DEBUG DATABASE_URL = postgres://dbadmin:MFpOTUIVvuON201Bx0Xj@127.0.0.1:15432/assetdb?sslmode=no-verify
+Rates API listening on http://localhost:3001
