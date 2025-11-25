@@ -1,0 +1,254 @@
+修正ルール ver.2025-11-15（資産管理システム）
+
+0. 目的と前提
+•目的
+1.新しい修正を入れても、既に動いている機能を壊さないこと
+2.何か問題が起きても「どの修正が原因かすぐに戻れる」状態を保つこと
+3.修正した内容をすべてルールに蓄積して、同じ失敗を繰り返さないこと
+•適用対象
+•フロントエンド（React / ManualEntry.tsx など）
+•バックエンド（rates-api.js）
+•DB（PostgreSQL / app.manual_entry 他）
+
+⸻
+
+1. 作業の基本フロー
+
+1-1. 毎回の作業ステップ（共通）
+1.作業範囲を1つだけ宣言する
+　•例）「7月の月末残高ロジックだけ」「手入力の保存だけ」など
+　•2つ以上を一気にやらない
+2.修正前にバックアップ & Gitコミット
+　•フロント修正前：
+cp src/pages/ManualEntry.tsx src/pages/ManualEntry.tsx.backup_$(date +%Y%m%d_%H%M%S)
+
+　•サーバ修正前：
+cp rates-api.js rates-api.js.backup_$(date +%Y%m%d_%H%M%S)
+
+　•DB修正前：
+必要に応じて
+pg_dump assetdb > backup_assetdb_$(date +%Y%m%d_%H%M%S).sql
+
+　•Git：
+git status
+git commit -am "before change: <内容>"   # 汚れていたら
+
+3.コード修正を行う（1機能だけ）
+4.修正後テストを必ず実行（後述のチェックリスト）
+5.OKなら Git コミット ＋ 修正ルールに1行追記
+　•例）
+2025-11-15: manual_entry.apply_month_avg_rates を月末レート対応に変更。手入力・CSV・ダッシュボードのテストを実施してOK。
+
+6.必要なら DB の app.system_policy などに修正ルール全文を更新して保存。
+
+⸻
+
+2. 守るべき「完成エリア」
+
+ここは「壊してはいけない優先領域」。
+この機能を触ったときは必ずテストを全て回す。
+1.手入力ページ
+　•IN/OUT/CF_IN/CF_OUT の新規追加
+　•編集・削除（論理削除）
+　•円換算 jpy_amount の自動計算
+2.CSVアップロード・コミット・月末残高作成
+　•/api/csv-import
+　•/api/csv-import/commit
+　•月末残高（category2_name=‘月末残高’）の投入
+3.ダッシュボード
+　•/api/dashboard/summary
+　•/api/dashboard/monthly
+　•/api/assets（資産一覧）
+
+⸻
+
+3. DB 制約ルール（壊すと全体が崩れる部分）
+
+3-1. manual_entry.flow_type の許容値
+flow_type IN ('IN','OUT','CF_IN','CF_OUT')
+　•新規追加・編集・CSVすべて、この4種類だけに収まる必要がある。
+
+⸻
+
+3-2. manual_entry.currency のホワイトリスト
+UPPER(TRIM(currency)) ~ '^(JPY|USD|AED|TWD|IDR|BTC|ETH|USDT|USDC|EGP|EUR|GBP)$'
+
+　•通貨を追加したい時は、必ずこの制約も更新する。
+　•通貨名の揺れ（YEN, 円, NT$, NTD など）は
+/api/manual-entry 側の normalize で正規化する。
+
+⸻
+
+3-3. flow_type × category2_name の組合せ
+
+CF_IN / CF_OUT のとき
+　•許容：
+　•NULL
+　•空文字
+　•資金移動(受取)
+　•資金移動(送金)
+
+IN のとき
+　•許容：
+　•NULL / 空文字
+　•サイト収益 / 投資収益 / 社債金利収益 / その他収益 / 月末残高
+
+OUT のとき
+　•許容：
+　•NULL / 空文字
+　•法人支出 / 個人支出 / 立替費用 / 投資支出 / その他支出
+
+※ この制約違反は INSERT/UPDATE 時点でエラー になるので、
+「手動追加できない」「編集の保存が落ちる」といった症状につながる。
+
+⸻
+
+4. サーバー（rates-api.js）のルール
+
+4-1. POST /api/manual-entry のバリデーション
+
+必須：
+　•trade_date（YYYY-MM-DD）
+　•account_name（空NG）
+　•flow_type（IN / OUT / CF_IN / CF_OUT）
+　•currency（上記ホワイトリストに合うコードに正規化できること）
+　•amount > 0
+　•segment が以下いずれかに正規化されること：
+　•corporate / personal / corporate_invest / personal_invest
+
+※ ここを変える or 強化する時は、手入力の新規追加4パターンのテストを絶対に行う。
+
+⸻
+
+4-2. レート＆円換算のルール
+　•レート未指定の場合
+→ fx_rate_monthly（+ crypto_usd_monthly）から「月末レート」または「定めたレート」を取得
+　•jpy_amount = amount × rate をサーバ側で再計算する
+　•BTC/ETH は
+　•crypto_usd_monthly.usd_month_avg × USDレート で JPY レートを算出
+　•USDT/USDC は USDと同じレート（peg-USD）を使う。
+
+⸻
+
+4-3. source_hash の扱い
+　•CSV由来の重複を防ぐための一意キー。
+　•source_hash の計算ロジックを変える場合は、
+　•既存データに影響が出ないか
+　•同じCSVを再取り込みしたときにどう振る舞うか
+を必ず検証する。
+
+⸻
+
+5. フロント（ManualEntry.tsx）のルール
+1.サーバーを真実とする
+　•タイプ（IN/OUT/CF_IN/CF_OUT）は APIの flow_type をそのまま使う
+　•フロントで独自変換して上書きしない。
+2.カテゴリ1 / カテゴリ2
+　•カテゴリ1（資産種別）は DB の category_name と一致させる。
+　•カテゴリ2 は上記 flow_type × category2_name 制約の範囲で UI を出し分ける。
+　•手入力UIの選択肢を変える時は、DB制約との整合を必ず確認。
+3.削除（論理削除）
+　•content / memo に 【削除済み】 を付与し、amount=0 などのルールを統一。
+　•フロント側一覧では「削除済み」は常に非表示フィルタ。
+4.APIに対する型・フィールド名
+　•type → flow_type
+　•category → category_name
+　•category2 → category2_name
+　•segment は '法人資産' 等を segCode() で英語コードへ変換して送る。
+
+⸻
+
+6. テストルール（修正後に必ず実行すること）
+
+6-1. 手入力テスト（最低限）
+　•IN（法人資産/個人資産のどちらか）を1件追加 → 成功
+　•OUT を1件追加 → 成功
+　•CF_IN（資金移動(受取)）を1件追加 → 成功
+　•CF_OUT（資金移動(送金)）を1件追加 → 成功
+　•上記4件が一覧に表示され、CSVに出力される
+　•円換算が amount × rate になっている
+
+6-2. CSV & 月末残高
+　•CSVアップロード → /api/csv-import でエラーなし
+　•/api/csv-import/commit が 200/OK
+　•月末残高（category2_name=‘月末残高’）が正しく追加される
+　•元CSVと account + currency + amount が一致する（7月のように突合OK）
+
+6-3. ダッシュボード
+　•/api/dashboard/summary が 200/OK で now/prev に値が出る
+　•/api/dashboard/monthly が 12件返す
+　•/api/assets がエラー無しで一覧を返す
+
+⸻
+
+7. Git 運用ルール
+1.1機能1コミット
+　•DB制約の変更
+　•rates-api.js の変更
+　•フロントのUI/ロジック変更
+を 必ず別コミットに分割する。
+2.PR/差分の自己レビュー
+　•「どのファイルのどこが変わったか」を必ず自分で確認してから作業継続。
+
+⸻
+
+8. 修正後ルール（今回追加する重要項目）
+
+8-1. 修正したら、必ず修正ルールに1行追記する
+
+書式例：
+　•YYYY-MM-DD: どのファイルの何を修正したか。どのテストを回してOKだったか。
+　•例：
+2025-11-15: rates-api.js の /api/manual-entry を月末レート対応に変更。手入力4種・CSVインポート・ダッシュボードを確認済み。
+
+この一行が、将来その修正を見直すときの命綱になります。
+
+8-2. 修正ルール自体も Git と DB で管理する
+　•修正ルール.txt をリポジトリ内で管理
+　•重要な変更後に、DB側にも保存（例：app.system_policy テーブル）
+
+⸻
+
+9. 修正禁止項目（要相談枠）
+
+以下を 単独の判断で変えない。変更するときは必ず「どの機能に影響するか」を先に洗い出す。
+　•manual_entry の制約削除
+　•flow_type 判定ロジックの大きな変更
+　•currency 正規化ロジックの削除や書き換え
+　•category2_name の仕様変更
+　•jpy_amount の手動書き換え
+　•segment を NULL にする実装
+
+2025-11-XX：為替レートは Fixer.io の月末レートを使用。
+FX レートは app.fx_rate_monthly に保存し、手入力／CSV／ダッシュボードは必ずこのテーブル経由で使う。
+当月の月末レートがまだ無い場合は「前月末レート」を使う。
+
+2025-11-25：/api/manual-entry の flow_type 正規化ルールを DB 制約に完全一致させた。
+IN / OUT / CF_IN / CF_OUT の4種類のみを許可し、normalizeFlow() も同一の4値だけを返すようにする。
+旧データ由来の 'CF' / 'CASHFLOW' / 'キャッシュフロー' は暫定的に 'CF_OUT' として扱い、新規実装には使用しない。
+
+	•	2025-11-XX：手入力の POST /api/manual-entry は category2_name に「カテゴリ2ラベルのみ」を渡すこと。カテゴリ1との結合 "カテゴリ1|カテゴリ2" は使わない（DB 制約 ck_type_cat2_monthend を必ず満たすこと）。
+
+2025-11-XX：手入力の POST /api/manual-entry では
+・category_name にフォームの「カテゴリ（資産種別）」をそのまま渡す
+・category2_name にはカテゴリ2ラベルのみを渡し、「カテゴリ1|カテゴリ2」の結合形式は使用しない
+
+4-4. レート取得（Fixer / CoinGecko）
+　•法定通貨（AED/EUR/GBP/EGP/USD…）は Fixer の「月末レート」を使用
+　•当月末のレートがまだ取得不可の場合 → 前月末レートを使用
+　•暗号通貨（BTC/ETH）は CoinGecko の daily → USD → 円換算方式を継続
+　•USDT/USDC は常に USD と同一レート（peg-USD）
+　•fx_rate_monthly が存在しない場合は必ず先に /admin/rates/sync を実行
+
+5-2. カテゴリUIのデータソース
+　•カテゴリ1（category_name）は DB app.manual_entry_category を唯一の真実とする
+　•フロントは /api/manual-entry/categories または /api/assets から受信した一覧のみを表示
+　•フロントがハードコードしたカテゴリ名を持ってはいけない
+
+8-3. 月末作業の定型化（必須）
+　•毎月1日に以下を必ず実行する：
+　　1) /admin/rates/sync?month=YYYY-MM を実行して月末レートを取得
+　　2) app.fx_rate_monthly に正しく値が入っていることを確認
+　　3) apply_month_avg_rates() により全レコードの円換算が更新されることを確認
+
+2025-11-25: rates-api.js に Fixer.io 月末レート連携と /admin/rates/sync を実装。2025-01〜10 月のレート同期とManualEntry 4パターン＋CSVインポート＋Dashboardを確認済み。
