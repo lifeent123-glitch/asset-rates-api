@@ -1,0 +1,1503 @@
+import crypto from "crypto";
+import dotenv from "dotenv";
+dotenv.config();
+
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+
+if (process.env.DATABASE_URL) {
+  let url = String(process.env.DATABASE_URL).trim();
+
+  // postgresql:// → postgres:// に統一（正規表現を使わず安全に）
+  const lower = url.toLowerCase();
+  if (lower.startsWith('postgresql://')) {
+    url = 'postgres://' + url.slice('postgresql://'.length);
+  }
+
+  // # と ! を URL エンコード（replaceAll は Node 14+ で可）
+  if (url.includes('#') || url.includes('!')) {
+    url = url.replaceAll('#', '%23').replaceAll('!', '%21');
+  }
+
+  process.env.DATABASE_URL = url;
+
+  // マスクして表示（パスワードは出さない）
+  try {
+    const u = new URL(url);
+    const masked = `${u.protocol}//${u.username}:${"*".repeat(8)}@${u.hostname}:${u.port}${u.pathname}${u.search || ""}`;
+    console.log("DATABASE_URL normalized:", masked);
+  } catch {
+    console.log("DATABASE_URL normalized.");
+  }
+}
+
+import cors from "cors";
+import express from "express";
+import pg from "pg";
+import multer from "multer";
+import { parse } from "csv-parse/sync";
+import cron from "node-cron";
+import fetch from "node-fetch";
+
+const { Pool } = pg;
+const { DATABASE_URL = "", PORT = 3001 } = process.env;
+
+const BUILD_TAG = "manual-entry-debug-v2";
+
+console.log("DEBUG DATABASE_URL =", DATABASE_URL);
+if (!DATABASE_URL) {
+  console.error("ERROR: DATABASE_URL is not set");
+  process.exit(1);
+}
+
+const pool = new Pool({
+  connectionString: DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
+});
+
+const app = express();
+app.use(
+  cors({
+    origin: ["http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:5174"],
+    methods: ["GET", "POST", "PUT", "OPTIONS"],
+    allowedHeaders: ["Content-Type"],
+    optionsSuccessStatus: 204,
+  })
+);
+app.options(/.*/, cors());
+app.use(express.json());
+app.use((req, res, next) => {
+  res.setHeader("Cache-Control", "no-store");
+  next();
+});
+
+const normalizeCode = (code) => {
+  const s = (code || "").toString().trim().toUpperCase();
+  if (!s) return null;
+  if (["JPY", "YEN", "JPN"].includes(s)) return "JPY";
+  if (["NT$", "NTD", "TWD"].includes(s)) return "TWD";
+  if (["WBTC", "XBT"].includes(s)) return "BTC";
+  return s;
+};
+
+const avg = (arr) => {
+  if (!arr || arr.length === 0) return null;
+  return arr.reduce((a, b) => a + b, 0) / arr.length;
+};
+
+function monthRange(ym) {
+  const [y, m] = ym.split("-").map(Number);
+  const start = new Date(Date.UTC(y, m - 1, 1));
+  const end = new Date(Date.UTC(y, m, 0));
+  return { start, end };
+}
+
+async function getCurrencyUniverse() {
+  const client = await pool.connect();
+  try {
+    const fiat = new Set();
+    const cryptoSet = new Set();
+    const pegged = new Set();
+
+    try {
+      const { rows } = await client.query(`
+        SELECT UPPER(code) AS code, LOWER(type) AS type, COALESCE(enabled,true) AS enabled
+        FROM app.currency_master
+      `);
+      if (rows?.length) {
+        for (const r of rows) {
+          if (!r.enabled) continue;
+          const c = normalizeCode(r.code);
+          if (!c || c === "JPY") continue;
+          if (r.type === "crypto") cryptoSet.add(c);
+          else if (r.type === "pegged_usd") pegged.add(c);
+          else fiat.add(c);
+        }
+      }
+    } catch {
+    }
+
+    const { rows: used } = await client.query(`
+      WITH raw AS (
+        SELECT UPPER(TRIM(currency)) cur FROM app.manual_entry
+        UNION ALL SELECT UPPER(TRIM(currency)) FROM app.fx_rate_monthly
+        UNION ALL SELECT UPPER(TRIM(symbol))   FROM app.crypto_usd_monthly
+      )
+      SELECT DISTINCT cur FROM raw WHERE cur IS NOT NULL AND cur <> ''
+    `);
+
+    for (const r of used) {
+      const c = normalizeCode(r.cur);
+      if (!c || c === "JPY") continue;
+      if (fiat.has(c) || cryptoSet.has(c) || pegged.has(c)) continue;
+      if (["BTC", "ETH"].includes(c)) {
+        cryptoSet.add(c);
+      } else if (["USDT", "USDC"].includes(c)) {
+        pegged.add(c);
+      } else {
+        fiat.add(c);
+      }
+    }
+
+    return {
+      fiat: Array.from(fiat).sort(),
+      crypto: Array.from(cryptoSet).sort(),
+      pegged_usd: Array.from(pegged).sort(),
+    };
+  } finally {
+    client.release();
+  }
+}
+
+app.get('/healthz', (req, res) => res.json({ ok: true, tag: BUILD_TAG }));
+app.get('/api/dashboard/summary', async (req, res) => {
+  const month = String(req.query.month || '').trim();
+  const view  = String(req.query.view || 'total').trim();
+  const mode  = String(req.query.mode || 'avg').trim();
+
+  if (!month || !/^\d{4}-\d{2}$/.test(month)) {
+    return res.status(400).json({ error: 'month (YYYY-MM) is required' });
+  }
+
+  const sql = `
+  WITH
+  curr_total AS (
+  SELECT COALESCE(SUM(
+           CASE WHEN m.flow_type='IN'  THEN m.jpy_amount
+                WHEN m.flow_type='OUT' THEN -m.jpy_amount END
+         ),0) AS total
+  FROM app.manual_entry m
+  LEFT JOIN app.manual_entry_category c ON c.id = m.category_id
+  WHERE to_char(m.trade_date,'YYYY-MM') = $1
+    AND m.segment IN (
+      'corporate'::app.segment_type,
+      'personal'::app.segment_type,
+      'corporate_invest'::app.segment_type,
+      'personal_invest'::app.segment_type
+    )
+    AND COALESCE(c.category_name,'') <> 'è³‡é‡‘ç§»å‹•'
+    AND NOT (m.memo LIKE '%å‰Šé™¤æ¸ˆã¿%')
+),
+prev_total AS (
+  SELECT COALESCE(SUM(
+           CASE WHEN m.flow_type='IN'  THEN m.jpy_amount
+                WHEN m.flow_type='OUT' THEN -m.jpy_amount END
+         ),0) AS total
+  FROM app.manual_entry m
+  LEFT JOIN app.manual_entry_category c ON c.id = m.category_id
+  WHERE to_char(m.trade_date,'YYYY-MM') = to_char((to_date($1,'YYYY-MM') - INTERVAL '1 month'),'YYYY-MM')
+    AND m.segment IN (
+      'corporate'::app.segment_type,
+      'personal'::app.segment_type,
+      'corporate_invest'::app.segment_type,
+      'personal_invest'::app.segment_type
+    )
+    AND COALESCE(c.category_name,'') <> 'è³‡é‡‘ç§»å‹•'
+    AND NOT (m.memo LIKE '%å‰Šé™¤æ¸ˆã¿%')
+),
+  curr_corp AS (
+  SELECT COALESCE(SUM(CASE WHEN m.flow_type='IN'  THEN m.jpy_amount
+                           WHEN m.flow_type='OUT' THEN -m.jpy_amount END),0) AS total
+  FROM app.manual_entry m
+  LEFT JOIN app.manual_entry_category c ON c.id = m.category_id
+  WHERE to_char(m.trade_date,'YYYY-MM') = $1
+    AND m.segment IN ('corporate'::app.segment_type, 'corporate_invest'::app.segment_type)
+    AND COALESCE(c.category_name,'') <> 'è³‡é‡‘ç§»å‹•'
+    AND NOT (m.memo LIKE '%å‰Šé™¤æ¸ˆã¿%')
+),
+prev_corp AS (
+  SELECT COALESCE(SUM(CASE WHEN m.flow_type='IN'  THEN m.jpy_amount
+                           WHEN m.flow_type='OUT' THEN -m.jpy_amount END),0) AS total
+  FROM app.manual_entry m
+  LEFT JOIN app.manual_entry_category c ON c.id = m.category_id
+  WHERE to_char(m.trade_date,'YYYY-MM') = to_char((to_date($1,'YYYY-MM') - INTERVAL '1 month'),'YYYY-MM')
+    AND m.segment IN ('corporate'::app.segment_type, 'corporate_invest'::app.segment_type)
+    AND COALESCE(c.category_name,'') <> 'è³‡é‡‘ç§»å‹•'
+    AND NOT (m.memo LIKE '%å‰Šé™¤æ¸ˆã¿%')
+),
+  curr_person AS (
+    SELECT COALESCE(SUM(CASE WHEN m.flow_type='IN'  THEN m.jpy_amount
+                             WHEN m.flow_type='OUT' THEN -m.jpy_amount END),0) AS total
+    FROM app.manual_entry m
+    LEFT JOIN app.manual_entry_category c ON c.id = m.category_id
+    WHERE to_char(m.trade_date,'YYYY-MM') = $1
+      AND m.segment IN ('personal'::app.segment_type, 'personal_invest'::app.segment_type)
+      AND COALESCE(c.category_name,'') <> 'è³‡é‡‘ç§»å‹•'
+      AND NOT (m.memo LIKE '%å‰Šé™¤æ¸ˆã¿%')
+  ),
+  prev_person AS (
+    SELECT COALESCE(SUM(CASE WHEN m.flow_type='IN'  THEN m.jpy_amount
+                             WHEN m.flow_type='OUT' THEN -m.jpy_amount END),0) AS total
+    FROM app.manual_entry m
+    LEFT JOIN app.manual_entry_category c ON c.id = m.category_id
+    WHERE to_char(m.trade_date,'YYYY-MM') = to_char((to_date($1,'YYYY-MM') - INTERVAL '1 month'),'YYYY-MM')
+      AND m.segment IN ('personal'::app.segment_type, 'personal_invest'::app.segment_type)
+      AND COALESCE(c.category_name,'') <> 'è³‡é‡‘ç§»å‹•'
+      AND NOT (m.memo LIKE '%å‰Šé™¤æ¸ˆã¿%')
+  )
+  SELECT
+    (SELECT total FROM curr_total)   AS now_total,
+    (SELECT total FROM prev_total)   AS prev_total,
+    (SELECT total FROM curr_corp)    AS now_corp,
+    (SELECT total FROM prev_corp)    AS prev_corp,
+    (SELECT total FROM curr_person)  AS now_person,
+    (SELECT total FROM prev_person)  AS prev_person
+`;
+
+  try {
+    const { rows } = await pool.query(sql, [month]);
+    const r = rows[0] || {};
+    return res.json({
+      month,
+      rate_mode: mode,
+      by_view: {
+        total:     { now: Number(r.now_total||0),  prev: Number(r.prev_total||0) },
+        corporate: { now: Number(r.now_corp||0),   prev: Number(r.prev_corp||0) },
+        personal:  { now: Number(r.now_person||0), prev: Number(r.prev_person||0) },
+        unassigned:{ now: Number(r.now_total||0) - Number(r.now_corp||0) - Number(r.now_person||0),
+                     prev: Number(r.prev_total||0) - Number(r.prev_corp||0) - Number(r.prev_person||0) }
+      }
+    });
+  } catch (e) {
+    console.error('[dashboard/summary] error', e);
+    return res.status(500).json({ error: 'dashboard_summary_failed' });
+  }
+});
+app.get('/api/dashboard/monthly', async (req, res) => {
+  const year = String(req.query.year || '').trim();
+  const view = String(req.query.view || 'total').trim();
+  const mode = String(req.query.mode || 'avg').trim();
+
+  if (!year || !/^\d{4}$/.test(year)) {
+    return res.status(400).json({ error: 'year (YYYY) is required' });
+  }
+
+  const segFilterInner =
+  view === 'corporate'
+    ? " AND me.segment IN ('corporate'::app.segment_type,'corporate_invest'::app.segment_type) "
+  : view === 'personal'
+    ? " AND me.segment IN ('personal'::app.segment_type,'personal_invest'::app.segment_type) "
+  : " AND me.segment IN ('corporate'::app.segment_type,'personal'::app.segment_type,'corporate_invest'::app.segment_type,'personal_invest'::app.segment_type) ";
+
+  const sql = `
+    WITH months AS (
+      SELECT generate_series(
+        to_date($1||'-01','YYYY-MM'),
+        to_date($1||'-12','YYYY-MM'),
+        interval '1 month'
+      ) AS month_start
+    )
+    SELECT
+      to_char(m.month_start,'YYYY-MM') AS month,
+      COALESCE((
+        SELECT SUM(CASE WHEN me.flow_type='IN'  THEN me.jpy_amount
+                        WHEN me.flow_type='OUT' THEN -me.jpy_amount
+                        ELSE 0 END)
+          FROM app.manual_entry me
+          LEFT JOIN app.manual_entry_category c ON c.id = me.category_id
+         WHERE date_trunc('month', me.trade_date) = date_trunc('month', m.month_start)
+           ${segFilterInner}
+           AND COALESCE(c.category_name,'') <> 'è³‡é‡‘ç§»å‹•'
+AND NOT (me.memo LIKE '%å‰Šé™¤æ¸ˆã¿%')
+      ),0) AS total
+    FROM months m
+    ORDER BY month;
+  `;
+
+  const client = await pool.connect();
+  try {
+    const { rows } = await client.query(sql, [year]);
+    const normalized = rows.map(r => {
+  const val = Number(r.total);
+  return {
+    month: r.month,
+    total: val,
+    total: val,
+    total_jpy: val,
+    value: val,
+    amount: val
+  };
+});
+return res.json(normalized);
+  } catch (e) {
+    console.error('[dashboard/monthly] error', e);
+    return res.status(500).json({ error: 'dashboard_monthly_failed' });
+  } finally {
+    client.release();
+  }
+});
+
+app.get('/api/rates/monthly', async (req, res) => {
+  try {
+    const year = String(req.query.year || new Date().getFullYear());
+    const sql = `
+      SELECT to_char(month, 'YYYY-MM') AS ym, currency, avg_rate
+      FROM app.fx_rate_monthly
+      WHERE EXTRACT(YEAR FROM month) = $1::int
+      ORDER BY ym, currency
+    `;
+    const { rows } = await pool.query(sql, [year]);
+
+    const map = new Map();
+    for (const r of rows) {
+      const ym = String(r.ym);
+      const cur = String(r.currency).toUpperCase();
+      const rate = Number(r.avg_rate);
+      if (!map.has(ym)) map.set(ym, { month: ym });
+      map.get(ym)[cur] = rate;
+    }
+
+    const months = Array.from({ length: 12 }, (_, i) => `${year}-${String(i+1).padStart(2,'0')}`);
+    const data = months.map(ym => map.get(ym) || { month: ym });
+    res.json(data);
+  } catch (e) {
+    console.error('[rates/monthly] error', e);
+    res.status(500).json({ error: 'rates_monthly_failed' });
+  }
+});
+
+app.get('/api/assets', async (req, res) => {
+  const month = String(req.query.month || '').trim();
+  const view  = String(req.query.view  || 'total').trim();
+  const cur   = String(req.query.currency || 'JPY').trim();
+
+  if (!month || !/^\d{4}-\d{2}$/.test(month)) {
+    return res.status(400).json({ error: 'month (YYYY-MM) is required' });
+  }
+
+  const segFilter =
+      view === 'corporate'
+      ? " AND m.segment IN ('corporate'::app.segment_type,'corporate_invest'::app.segment_type) "
+      : view === 'personal'
+      ? " AND m.segment IN ('personal'::app.segment_type,'personal_invest'::app.segment_type) "
+      : " AND m.segment IN ('corporate'::app.segment_type,'personal'::app.segment_type,'corporate_invest'::app.segment_type,'personal_invest'::app.segment_type) ";
+
+  const sql = `
+    WITH base AS (
+      SELECT m.account_name,
+             m.segment,
+             m.flow_type,
+             m.jpy_amount,
+             m.trade_date
+        FROM app.manual_entry m
+   LEFT JOIN app.manual_entry_category c ON c.id = m.category_id
+       WHERE to_char(m.trade_date,'YYYY-MM') = $1
+         ${segFilter}
+         AND COALESCE(c.category_name,'') <> 'è³‡é‡‘ç§»å‹•'
+    ),
+    agg AS (
+      SELECT account_name,
+             -- segment ã¯è¡¨ç¤ºç”¨(ä»£è¡¨å€¤)ã€‚åŒä¸€å£åº§ã§æ··åœ¨ã™ã‚‹å ´åˆã¯æœ€é »å€¤ã«ã—ãŸã„ãŒã€ã¾ãšã¯æœ€å¤§ä»¶æ•°ã®æ–¹ã‚’æŽ¡ç”¨
+             mode() within group (order by segment) AS segment,
+             sum(CASE WHEN flow_type='IN'  THEN jpy_amount
+                      WHEN flow_type='OUT' THEN -jpy_amount
+                      ELSE 0 END) AS total_jpy,
+             count(*) AS cnt,
+             max(trade_date) AS last_date
+        FROM base
+    GROUP BY account_name
+    )
+    SELECT
+      a.account_name,
+      a.segment,
+      a.total_jpy::numeric AS total_jpy,
+      a.cnt,
+      a.last_date::date AS last_date
+    FROM agg a
+    ORDER BY a.total_jpy DESC, a.account_name;
+  `;
+
+  const client = await pool.connect();
+  try {
+    const { rows } = await client.query(sql, [month]);
+
+    let usdJpy = 1;
+    if (cur === 'USD') {
+      const q = `
+        SELECT rate_month_avg
+          FROM app.fx_rate_monthly
+         WHERE currency='USD'
+           AND to_char(month_start,'YYYY-MM')=$1
+         LIMIT 1`;
+      const r2 = await client.query(q, [month]);
+      usdJpy = Number(r2.rows?.[0]?.rate_month_avg ?? 1) || 1;
+    }
+
+    const mapped = rows.map(r => {
+      const jpy = Number(r.total_jpy || 0);
+      const display = (cur === 'USD') ? (jpy / usdJpy) : jpy;
+      return {
+        account_name: r.account_name,
+        segment: r.segment,
+        cnt: Number(r.cnt || 0),
+        last_date: r.last_date,
+        total_jpy: jpy,
+        total_display: display
+      };
+    });
+
+    return res.json({ month, view, currency: cur, rows: mapped });
+  } catch (e) {
+    console.error('[assets] error', e);
+    return res.status(500).json({ error: 'assets_failed' });
+  } finally {
+    client.release();
+  }
+});
+
+const upload = multer({ storage: multer.memoryStorage() });
+
+app.post(
+  "/api/csv-import",
+  (req, res, next) => {
+    upload.single("file")(req, res, (err) => {
+      if (err) return res.status(500).json({ error: err.message });
+      next();
+    });
+  },
+  async (req, res) => {
+    try {
+      if (!req.file) return res.status(400).json({ error: "file is required" });
+      const text = req.file.buffer.toString("utf-8");
+      const records = parse(text, {
+        columns: true,
+        skip_empty_lines: true,
+        trim: true,
+      });
+
+      const localPool = new pg.Pool({
+        connectionString: process.env.DATABASE_URL,
+        ssl: { rejectUnauthorized: false },
+      });
+      const client = await localPool.connect();
+
+      // ★ トランザクション開始
+      await client.query('BEGIN');
+      console.log('=== CSV import transaction started ===');
+
+      const pick = (obj, keys) => {
+        for (const k of keys) {
+          if (obj[k] !== undefined && obj[k] !== null) {
+            const v = String(obj[k]).trim();
+            if (v !== "") return v;
+          }
+        }
+        return null;
+      };
+
+      const toNum = (v) => {
+        if (v == null) return null;
+        const s = String(v).normalize("NFKC").trim().replace(/[^\d.-]/g, "");
+        return s && /^-?\d+(\.\d+)?$/.test(s) ? Number(s) : null;
+      };
+
+      console.log('=== CSV import start ===');
+      console.log('Records count:', records.length);
+
+      let i = 0;
+for (const r of records) {
+  i++;
+
+  const pick = (obj, keys) => {
+    for (const k of keys) {
+      const v = obj?.[k];
+      if (v != null && String(v).trim() !== "") return String(v).trim();
+    }
+    return "";
+  };
+
+  const tradeDate        = pick(r, ["trade_date", "date", "csvdate", "\ufeffæ—¥ä»˜", "æ—¥ä»˜"]) || null;
+  const accountName      = pick(r, ["account_name", "account", "å£åº§ãƒ»ã‚¦ã‚©ãƒ¬ãƒƒãƒˆå"]) || null;
+  const flowType         = (pick(r, ["flow_type", "type", "ã‚¿ã‚¤ãƒ—"]) || "IN").toUpperCase();
+  const categoryName     = pick(r, ["category_name", "category", "ã‚«ãƒ†ã‚´ãƒª1", "ã‚«ãƒ†ã‚´ãƒª"]) || null;
+  const amountNum        = toNum(pick(r, ["amount", "é‡‘é¡"]));
+  const currencyCode     = (pick(r, ["currency", "curr", "é€šè²¨", "\ufeffé€šè²¨", "Currency"]) || "").toUpperCase() || null;
+  const rateNum          = toNum(pick(r, ["rate", "ãƒ¬ãƒ¼ãƒˆ"]));
+  const jpyAmountNum     = toNum(pick(r, ["jpy_amount", "å††å»ºã¦é‡‘é¡"]));
+  // ★ 修正: content と memo を分離
+  const contentText      = pick(r, ["content", "å†…å®¹"]) || null;
+  const memoText         = pick(r, ["memo", "ãƒ¡ãƒ¢"]) || null;
+  const segmentVal       = pick(r, ["segment", "åŒºåˆ†"]) || null;
+
+  await client.query(
+    `INSERT INTO staging.csv_import_raw
+     (source_file, row_num, trade_date, account_name, flow_type, category_name, amount, currency, rate, jpy_amount, content, memo, segment)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+    [
+      req.file.originalname,
+      i,
+      tradeDate,
+      accountName,
+      flowType,
+      categoryName,
+      amountNum,
+      currencyCode,
+      rateNum,
+      jpyAmountNum,
+      contentText,  // ★ 追加: content を11番目に
+      memoText,     // ★ 変更: 11番目 → 12番目に
+      segmentVal,   // ★ 変更: 12番目 → 13番目に
+    ]
+  );
+}
+
+      console.log('=== CSV import completed ===');
+      console.log('Total rows inserted:', i);
+
+      // staging テーブルの件数を確認（トランザクション内）
+      const checkResult = await client.query('SELECT COUNT(*) FROM staging.csv_import_raw');
+      console.log('Staging table count in transaction:', checkResult.rows[0].count);
+
+      // ★ トランザクションをコミット
+      await client.query('COMMIT');
+      console.log('=== Transaction committed ===');
+
+      // コミット後の件数を確認
+      const checkAfterCommit = await client.query('SELECT COUNT(*) FROM staging.csv_import_raw');
+      console.log('Staging table count after commit:', checkAfterCommit.rows[0].count);
+
+      res.json({ inserted: records.length });
+      await client.release();
+      await localPool.end();
+    } catch (e) {
+      console.error("csv_import_failed", e);
+      console.error("Error stack:", e.stack);
+      
+      // ★ エラー時はロールバック
+      try {
+        await client.query('ROLLBACK');
+        console.log('=== Transaction rolled back ===');
+      } catch (rollbackError) {
+        console.error('Rollback failed:', rollbackError);
+      }
+      
+      res.status(500).json({ error: e.message });
+    }
+  }
+);
+
+app.post("/api/csv-import/commit", async (req, res) => {
+  console.log("=== CSV Commit Start ==="); 
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    console.log("✓ Transaction started"); 
+    
+    // ステージングテーブルの件数を確認
+    const countBefore = await client.query("SELECT COUNT(*) FROM staging.csv_import_raw");
+    console.log("✓ Staging records BEFORE commit:", countBefore.rows[0].count);
+
+    // WHERE句適用後の件数を確認
+    const srcCount = await client.query(`
+      SELECT COUNT(*) 
+      FROM staging.csv_import_raw s
+      WHERE btrim(replace(s.trade_date::text,' ','')) <> ''
+        AND replace(s.trade_date::text,'/','-') ~ '^[0-9]{4}-[0-9]{1,2}-[0-9]{1,2}$'
+    `);
+    console.log("✓ Records after WHERE filter:", srcCount.rows[0].count);
+
+    // サンプルデータを確認
+    const sample = await client.query(`
+      SELECT trade_date, account_name, amount, currency, segment
+      FROM staging.csv_import_raw
+      LIMIT 3
+    `);
+    console.log("✓ Sample staging data:", JSON.stringify(sample.rows, null, 2));
+
+    // 重複チェック用のハッシュを確認
+    const hashSample = await client.query(`
+      SELECT 
+        md5(
+          COALESCE(source_file,'') || ':' ||
+          COALESCE(row_num::text,'') || ':' ||
+          COALESCE(trade_date::text,'') || ':' ||
+          COALESCE(account_name,'') || ':' ||
+          COALESCE(flow_type,'') || ':' ||
+          COALESCE(category_name,'') || ':' ||
+          COALESCE(amount::text,'') || ':' ||
+          COALESCE(currency,'') || ':' ||
+          COALESCE(rate::text,'') || ':' ||
+          COALESCE(jpy_amount::text,'') || ':' ||
+          COALESCE(content,'') || ':' ||
+          COALESCE(memo,'') || ':' ||
+          COALESCE(segment,'')
+        ) AS shash
+      FROM staging.csv_import_raw
+      LIMIT 3
+    `);
+    console.log("✓ Sample hashes:", JSON.stringify(hashSample.rows, null, 2));
+
+    // 既存データと重複チェック
+    const duplicateCheck = await client.query(`
+      SELECT COUNT(*) 
+      FROM staging.csv_import_raw s
+      INNER JOIN app.manual_entry m ON m.source_hash = md5(
+        COALESCE(s.source_file,'') || ':' ||
+        COALESCE(s.row_num::text,'') || ':' ||
+        COALESCE(s.trade_date::text,'') || ':' ||
+        COALESCE(s.account_name,'') || ':' ||
+        COALESCE(s.flow_type,'') || ':' ||
+        COALESCE(s.category_name,'') || ':' ||
+        COALESCE(s.amount::text,'') || ':' ||
+        COALESCE(s.currency,'') || ':' ||
+        COALESCE(s.rate::text,'') || ':' ||
+        COALESCE(s.jpy_amount::text,'') || ':' ||
+        COALESCE(s.content,'') || ':' ||
+        COALESCE(s.memo,'') || ':' ||
+        COALESCE(s.segment,'')
+      )
+    `);
+    console.log("✓ Duplicate records found:", duplicateCheck.rows[0].count);
+
+    // INSERT実行
+    const result = await client.query(`
+      WITH usd_rates AS (
+        SELECT to_char(month_start,'YYYY-MM') AS ym, rate_month_avg
+        FROM app.fx_rate_monthly
+        WHERE currency='USD'
+      ),
+      crypto_rates AS (
+        SELECT to_char(c.month_start,'YYYY-MM') AS ym, c.symbol, c.usd_month_avg * f.rate_month_avg AS jpy_rate
+        FROM app.crypto_usd_monthly c
+        JOIN app.fx_rate_monthly f
+          ON f.currency='USD' AND f.month_start=c.month_start
+      ),
+      src AS (
+        SELECT
+          s.*,
+          md5(
+            COALESCE(s.source_file,'') || ':' ||
+            COALESCE(s.row_num::text,'') || ':' ||
+            COALESCE(s.trade_date::text,'') || ':' ||
+            COALESCE(s.account_name,'') || ':' ||
+            COALESCE(s.flow_type,'') || ':' ||
+            COALESCE(s.category_name,'') || ':' ||
+            COALESCE(s.amount::text,'') || ':' ||
+            COALESCE(s.currency,'') || ':' ||
+            COALESCE(s.rate::text,'') || ':' ||
+            COALESCE(s.jpy_amount::text,'') || ':' ||
+            COALESCE(s.content,'') || ':' ||
+            COALESCE(s.memo,'') || ':' ||
+            COALESCE(s.segment,'')
+          ) AS shash
+        FROM staging.csv_import_raw s
+        WHERE
+          btrim(replace(s.trade_date::text,' ','')) <> ''
+          AND replace(s.trade_date::text,'/','-') ~ '^[0-9]{4}-[0-9]{1,2}-[0-9]{1,2}$'
+      ),
+      src_dedup AS (
+        SELECT DISTINCT ON (shash) *
+        FROM src
+        ORDER BY shash, row_num
+      )
+      INSERT INTO app.manual_entry
+        (trade_date, account_name, flow_type, category_id, category2_name,
+         amount, currency, rate, jpy_amount, content, memo, source, source_hash, segment)
+      SELECT
+        to_date(replace(sd.trade_date::text,'/','-'),'YYYY-FMMM-FMDD') AS trade_date,
+        COALESCE(sd.account_name,'') AS account_name,
+        UPPER(COALESCE(sd.flow_type,'')) AS flow_type,
+        NULL AS category_id,
+        COALESCE(sd.category_name,'') AS category2_name,
+        COALESCE(sd.amount,0) AS amount,
+
+        CASE
+          WHEN sd.currency IS NULL OR btrim(sd.currency)='' THEN 'JPY'
+          WHEN upper(replace(btrim(sd.currency),' ','')) IN ('å††','YEN','JPN') THEN 'JPY'
+          WHEN upper(replace(btrim(sd.currency),' ','')) IN ('NT$','NTD','TWD') THEN 'TWD'
+          WHEN upper(replace(btrim(sd.currency),' ','')) IN ('WBTC','XBT') THEN 'BTC'
+          ELSE upper(replace(btrim(sd.currency),' ',''))
+        END AS currency,
+
+        COALESCE(
+          CASE
+            WHEN upper(trim(replace(sd.currency,' ',''))) IN ('BTC','ETH','WBTC','XBT') THEN (
+              SELECT jpy_rate FROM crypto_rates
+               WHERE symbol = CASE
+                                WHEN upper(trim(replace(sd.currency,' ',''))) IN ('WBTC','XBT') THEN 'BTC'
+                                ELSE upper(trim(replace(sd.currency,' ','')))
+                              END
+                 AND ym = to_char(to_date(replace(sd.trade_date::text,'/','-'),'YYYY-FMMM-FMDD'),'YYYY-MM')
+            )
+            ELSE NULL
+          END,
+          CASE
+            WHEN NULLIF(regexp_replace(sd.rate::text, '[^0-9.+-]', '', 'g'), '') IS NOT NULL
+            THEN NULLIF(regexp_replace(sd.rate::text, '[^0-9.+-]', '', 'g'), '')::numeric
+            ELSE NULL
+          END,
+          CASE
+            WHEN upper(trim(replace(sd.currency,' ',''))) IN ('JPY','å††','YEN','JPN') THEN 1
+            WHEN upper(trim(replace(sd.currency,' ',''))) IN ('USD','USDT','USDC') THEN (
+              SELECT rate_month_avg FROM usd_rates
+               WHERE ym = to_char(to_date(replace(sd.trade_date::text,'/','-'),'YYYY-FMMM-FMDD'),'YYYY-MM')
+            )
+            ELSE COALESCE((
+              SELECT rate_month_avg
+                FROM app.fx_rate_monthly
+               WHERE currency = CASE
+                                  WHEN upper(trim(replace(sd.currency,' ',''))) IN ('NT$','NTD','TWD') THEN 'TWD'
+                                  WHEN upper(trim(replace(sd.currency,' ',''))) IN ('JPY','å††','YEN','JPN') THEN 'JPY'
+                                  ELSE upper(trim(replace(sd.currency,' ','')))
+                                END
+                 AND to_char(month_start,'YYYY-MM')
+                     = to_char(to_date(replace(sd.trade_date::text,'/','-'),'YYYY-FMMM-FMDD'),'YYYY-MM')
+               LIMIT 1
+            ), 1)
+          END
+        ) AS rate,
+
+        COALESCE(
+          CASE
+            WHEN sd.jpy_amount IS NULL OR btrim(replace(sd.jpy_amount::text,' ','')) = '' THEN NULL
+            ELSE sd.jpy_amount::numeric
+          END,
+          (
+            COALESCE(sd.amount,0) *
+            COALESCE(
+              CASE
+                WHEN NULLIF(regexp_replace(sd.rate::text, '[^0-9.+-]', '', 'g'), '') IS NOT NULL
+                THEN NULLIF(regexp_replace(sd.rate::text, '[^0-9.+-]', '', 'g'), '')::numeric
+                ELSE NULL
+              END,
+              CASE
+                WHEN upper(trim(replace(sd.currency,' ',''))) IN ('JPY','å††','YEN','JPN') THEN 1
+                WHEN upper(trim(replace(sd.currency,' ',''))) IN ('USD','USDT','USDC') THEN (
+                  SELECT rate_month_avg FROM usd_rates
+                   WHERE ym = to_char(to_date(replace(sd.trade_date::text,'/','-'),'YYYY-FMMM-FMDD'),'YYYY-MM')
+                )
+                WHEN upper(trim(replace(sd.currency,' ',''))) IN ('BTC','ETH','WBTC','XBT') THEN (
+                  SELECT jpy_rate FROM crypto_rates
+                   WHERE symbol = CASE
+                                    WHEN upper(trim(replace(sd.currency,' ',''))) IN ('WBTC','XBT') THEN 'BTC'
+                                    ELSE upper(trim(replace(sd.currency,' ','')))
+                                  END
+                     AND ym = to_char(to_date(replace(sd.trade_date::text,'/','-'),'YYYY-FMMM-FMDD'),'YYYY-MM')
+                )
+                ELSE COALESCE((
+                  SELECT rate_month_avg
+                    FROM app.fx_rate_monthly
+                   WHERE currency = CASE
+                                      WHEN upper(trim(replace(sd.currency,' ',''))) IN ('NT$','NTD','TWD') THEN 'TWD'
+                                      WHEN upper(trim(replace(sd.currency,' ',''))) IN ('JPY','å††','YEN','JPN') THEN 'JPY'
+                                      ELSE upper(trim(replace(sd.currency,' ','')))
+                                    END
+                     AND to_char(month_start,'YYYY-MM')
+                         = to_char(to_date(replace(sd.trade_date::text,'/','-'),'YYYY-FMMM-FMDD'),'YYYY-MM')
+                   LIMIT 1
+                ), 1)
+              END
+            )
+          )
+        , 0) AS jpy_amount,
+
+        COALESCE(sd.content,'') AS content,
+        COALESCE(sd.memo,'') AS memo,
+        'csv' AS source,
+        sd.shash AS source_hash,
+        CASE sd.segment
+          WHEN 'æ³•äººè³‡ç"£' THEN 'corporate'
+          WHEN 'å€‹äººè³‡ç"£' THEN 'personal'
+          WHEN 'æ³•äººæŠ•è³‡' THEN 'corporate_invest'
+          WHEN 'å€‹äººæŠ•è³‡' THEN 'personal_invest'
+          ELSE NULL
+        END::app.segment_type AS segment
+      FROM src_dedup sd
+      ON CONFLICT (source_hash) DO UPDATE SET
+        trade_date=EXCLUDED.trade_date,
+        account_name=EXCLUDED.account_name,
+        flow_type=EXCLUDED.flow_type,
+        category2_name=EXCLUDED.category2_name,
+        amount=EXCLUDED.amount,
+        currency=EXCLUDED.currency,
+        rate=EXCLUDED.rate,
+        jpy_amount=EXCLUDED.jpy_amount,
+        content=EXCLUDED.content,
+        memo=EXCLUDED.memo,
+        source=EXCLUDED.source,
+        segment=EXCLUDED.segment;
+    `);
+    
+    console.log("✓ INSERT completed. Rows affected:", result.rowCount);
+
+    // staging テーブルをクリア
+    await client.query("DELETE FROM staging.csv_import_raw");
+    console.log("✓ Staging table cleared");
+
+    await client.query("COMMIT");
+    console.log("✓ Transaction committed");
+    console.log("=== CSV Commit Success ===");
+    
+    res.json({ ok: true });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("=== CSV Commit Error ===");
+    console.error("Error message:", err.message);
+    console.error("Error detail:", err.detail);
+    console.error("Error hint:", err.hint);
+    res.status(500).send("csv_commit_failed");
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/api/manual-entry", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const body = req.body || {};
+    const normStr = (v) => (v ?? "").toString().trim();
+    const toNum = (v) => {
+      if (v === null || v === undefined || v === "") return null;
+      const n = Number(v);
+      return Number.isFinite(n) ? n : null;
+    };
+    const normalizeCurrency = (raw) => {
+      const s0 = normStr(raw).toUpperCase();
+      const s = s0.replace(/[^A-Z]/g, "");
+      if (!s) return null;
+      if (["JPY", "YEN", "JPN"].includes(s)) return "JPY";
+      if (["TWD", "NTD"].includes(s)) return "TWD";
+      if (["BTC", "WBTC", "XBT"].includes(s)) return "BTC";
+      return s;
+    };
+    const normalizeFlow = (raw) => {
+      const s = normStr(raw).toUpperCase();
+      if (s === "IN") return "IN";
+      if (s === "OUT") return "OUT";
+      if (s === "CF" || s === "CASHFLOW" || s === "ã‚­ãƒ£ãƒƒã‚·ãƒ¥ãƒ•ãƒ­ãƒ¼") return "ã‚­ãƒ£ãƒƒã‚·ãƒ¥ãƒ•ãƒ­ãƒ¼";
+      return null;
+    };
+    const normalizeSegment = (raw) => {
+      const s = normStr(raw);
+      if (["corporate", "æ³•äººè³‡ç”£"].includes(s)) return "corporate";
+      if (["personal", "å€‹äººè³‡ç”£"].includes(s)) return "personal";
+      if (["corporate_invest", "æ³•äººæŠ•è³‡"].includes(s)) return "corporate_invest";
+      if (["personal_invest", "å€‹äººæŠ•è³‡"].includes(s)) return "personal_invest";
+      return null;
+    };
+
+    const tradeDate = normStr(body.trade_date);
+    const accountName = normStr(body.account_name);
+    const flowType = normalizeFlow(body.flow_type);
+    const category2Name = normStr(body.category2_name || body.category2 || "");
+    const amount = toNum(body.amount);
+    const currency = normalizeCurrency(body.currency);
+    const rateCsv = toNum(body.rate);
+    const content = normStr(body.content);
+    const memo = normStr(body.memo);
+    const segment = normalizeSegment(body.segment);
+    console.log(
+      '[POST/manual-entry] rawCurrency="%s" -> normalized="%s" ym=%s',
+      body.currency,
+      currency,
+      tradeDate?.slice(0, 7)
+    );
+
+    if (!tradeDate || !/^\d{4}-\d{2}-\d{2}$/.test(tradeDate))
+      return res.status(400).json({ error: "trade_date (YYYY-MM-DD) is required" });
+    if (!accountName) return res.status(400).json({ error: "account_name is required" });
+    if (!flowType) return res.status(400).json({ error: "flow_type must be IN/OUT/ã‚­ãƒ£ãƒƒã‚·ãƒ¥ãƒ•ãƒ­ãƒ¼" });
+    if (amount === null || amount <= 0) return res.status(400).json({ error: "amount must be > 0" });
+    if (!currency) return res.status(400).json({ error: "currency is required" });
+
+    const ym = tradeDate.slice(0, 7);
+    let rateUsed = rateCsv;
+
+    if (rateUsed === null) {
+      if (currency === "BTC" || currency === "ETH") {
+        const { rows } = await client.query(
+          `SELECT c.usd_month_avg * f.rate_month_avg AS jpy_rate
+             FROM app.crypto_usd_monthly c
+             JOIN app.fx_rate_monthly f
+               ON f.currency='USD' AND to_char(f.month_start,'YYYY-MM')=$1
+            WHERE c.symbol=$2 AND to_char(c.month_start,'YYYY-MM')=$1
+            LIMIT 1`,
+          [ym, currency]
+        );
+        console.log("[POST/manual-entry] crypto lookup sym=%s ym=%s rows=%d", currency, ym, rows?.length || 0);
+        rateUsed = rows?.[0]?.jpy_rate ?? null;
+      } else if (currency === "JPY") {
+        rateUsed = 1;
+      } else if (["USDT", "USDC"].includes(currency)) {
+        const { rows } = await client.query(
+          `SELECT rate_month_avg FROM app.fx_rate_monthly
+            WHERE currency='USD' AND to_char(month_start,'YYYY-MM')=$1 LIMIT 1`,
+          [ym]
+        );
+        console.log("[POST/manual-entry] usd-peg lookup ym=%s rows=%d", ym, rows?.length || 0);
+        rateUsed = rows?.[0]?.rate_month_avg ?? null;
+      } else {
+        const { rows } = await client.query(
+          `SELECT rate_month_avg FROM app.fx_rate_monthly
+            WHERE currency=$1 AND to_char(month_start,'YYYY-MM')=$2 LIMIT 1`,
+          [currency, ym]
+        );
+        console.log("[POST/manual-entry] fiat lookup cur=%s ym=%s rows=%d", currency, ym, rows?.length || 0);
+        rateUsed = rows?.[0]?.rate_month_avg ?? null;
+      }
+    }
+
+    rateUsed = rateUsed == null ? null : Number(rateUsed);
+
+    if (rateUsed === null || !(Number.isFinite(rateUsed) && rateUsed > 0)) {
+      return res.status(400).json({
+        error: `rate is missing and monthly average not found for ${currency} in ${ym}`,
+      });
+    }
+
+    const jpyAmount = Number((amount * rateUsed).toFixed(4));
+    const source = "manual";
+    const sourceHash = crypto
+      .createHash("md5")
+      .update(`${source}:${tradeDate}:${accountName}:${flowType}:${amount}:${currency}:${rateUsed}:${content}:${memo}`)
+      .digest("hex");
+
+const sql = `
+  WITH ins AS (
+    INSERT INTO app.manual_entry
+      (trade_date, account_name, flow_type, category_id, category2_name,
+       amount, currency, rate, jpy_amount, content, memo, source, source_hash, segment)
+    VALUES
+      ($1,$2,$3, NULL, $4,
+       $5, $6, $7, $8, $9, $10, $11, $12, $13)
+    ON CONFLICT (source_hash) DO NOTHING
+    RETURNING id
+  )
+  SELECT id, true AS created FROM ins
+  UNION ALL
+  SELECT id, false AS created
+  FROM app.manual_entry
+  WHERE source_hash = $11
+  ORDER BY created DESC   -- â† è¿½åŠ :æ–°è¦ãŒã‚ã‚Œã°ãã‚Œã‚’å„ªå…ˆ
+  LIMIT 1
+`;
+const params = [
+  tradeDate,
+  accountName,
+  flowType,
+  category2Name || null,
+  amount,
+  currency,
+  rateUsed,
+  jpyAmount,
+  content || null,
+  memo || null,
+  source,
+  sourceHash,
+  segment,
+];
+
+const q = await client.query(sql, params);
+const row = q.rows?.[0];
+if (!row) {
+  return res.status(409).json({ error: "upsert failed: no row returned" });
+}
+return res.json({
+  status: "ok",
+  id: String(row.id),
+  created: !!row.created,
+  jpy_amount: jpyAmount,
+  rate: rateUsed
+});
+  } catch (e) {
+    console.error("manual_entry_insert_failed", e);
+    return res.status(400).json({ error: e.message || "insert_failed" });
+  } finally {
+    client.release();
+  }
+});
+
+app.put('/api/manual-entry/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const {
+      segment,
+      category2_name,
+      amount,
+      rate,
+      content,
+      memo,
+      flow_type,
+      currency,
+      account,
+      trade_date
+    } = req.body || {};
+
+    const sets = [];
+    const vals = [];
+
+    const pushSet = (sqlFrag, val) => {
+      sets.push(`${sqlFrag}=$${vals.length + 1}`);
+      vals.push(val);
+    };
+
+    if (segment != null && String(segment) !== '') pushSet('segment', String(segment));
+    if (category2_name != null && String(category2_name) !== '') pushSet('category2_name', String(category2_name));
+    if (content != null) pushSet('content', String(content));
+    if (memo != null) pushSet('memo', String(memo));
+    if (flow_type === 'IN' || flow_type === 'OUT') pushSet('flow_type', flow_type);
+    if (currency != null && String(currency) !== '') pushSet('currency', String(currency));
+    if (account != null && String(account) !== '') pushSet('account_name', String(account));
+    if (trade_date != null && String(trade_date) !== '') pushSet('trade_date', String(trade_date));
+
+    const hasAmount = amount != null && String(amount) !== '';
+    const hasRate   = rate   != null && String(rate)   !== '';
+
+    let amountParamNum = null;
+    let rateParamNum = null;
+
+    if (hasAmount) {
+      amountParamNum = vals.length + 1;
+      sets.push(`amount=CAST($${vals.length + 1} AS numeric(20,8))`);
+      vals.push(String(amount));
+    }
+    if (hasRate) {
+      rateParamNum = vals.length + 1;
+      sets.push(`rate=CAST($${vals.length + 1} AS numeric(20,8))`);
+      vals.push(String(rate));
+    }
+
+    if (hasAmount || hasRate) {
+      const amountExpr = amountParamNum != null ? `$${amountParamNum}::numeric` : 'amount';
+      const rateExpr = rateParamNum != null ? `$${rateParamNum}::numeric` : 'rate';
+      sets.push(`jpy_amount = CAST(${amountExpr} * ${rateExpr} AS numeric(20,4))`);
+    }
+
+    if (sets.length === 0) {
+      return res.status(400).json({ error: 'No fields to update' });
+    }
+
+    vals.push(id);
+    const sql = `
+      UPDATE app.manual_entry
+         SET ${sets.join(', ') }
+       WHERE id = $${vals.length}
+       RETURNING *;
+    `;
+
+    const result = await pool.query(sql, vals);
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: 'Not found' });
+    }
+    res.json({ status: 'ok', row: result.rows[0] });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+app.get("/api/manual-entry", async (req, res) => {
+  try {
+    const month = String(req.query.month ?? "").trim();
+    const segment = String(req.query.segment ?? "total").trim();
+    const currency = String(req.query.currency ?? "ALL").trim();
+    const excludeTransfer = String(req.query.exclude_transfer ?? "true") === "true";
+
+    if (!month) {
+      return res.status(400).json({ error: "month param required (YYYY-MM)" });
+    }
+
+    const params = [`${month}-01`, segment, currency, excludeTransfer];
+
+    const listSql = `
+  SELECT
+    m.id,
+    m.trade_date AS date,
+    m.account_name AS account,
+    m.flow_type AS type,
+    m.category_id,
+    COALESCE(c.category_name,'') AS category_name,
+    m.category2_name,
+    m.amount,
+    m.currency,
+    m.rate,
+    m.jpy_amount,
+    m.content, 
+    m.memo,
+    m.segment
+  FROM app.manual_entry m
+  LEFT JOIN app.manual_entry_category c ON c.id = m.category_id
+  WHERE date_trunc('month', m.trade_date) = $1::date
+    AND ($2 = 'total' OR m.segment = $2::app.segment_type)
+    AND ($3 = 'ALL' OR m.currency = $3)
+    AND (CASE WHEN $4 THEN COALESCE(c.category_name,'') <> 'è³‡é‡‘ç§»å‹•' ELSE TRUE END)
+  ORDER BY m.trade_date, m.id
+`;
+
+const sumSql = `
+  SELECT
+    COALESCE(SUM(CASE WHEN m.flow_type='IN'  THEN m.jpy_amount END),0) AS in_jpy,
+    COALESCE(SUM(CASE WHEN m.flow_type='OUT' THEN m.jpy_amount END),0) AS out_jpy,
+    COALESCE(SUM(CASE WHEN m.flow_type='CF'  THEN m.jpy_amount END),0) AS cf_jpy,
+    COALESCE(SUM(m.jpy_amount),0) AS total_jpy
+  FROM app.manual_entry m
+  LEFT JOIN app.manual_entry_category c ON c.id = m.category_id
+  WHERE date_trunc('month', m.trade_date) = $1::date
+    AND ($2 = 'total' OR m.segment = $2::app.segment_type)
+    AND ($3 = 'ALL' OR m.currency = $3)
+    AND (CASE WHEN $4 THEN COALESCE(c.category_name,'') <> 'è³‡é‡‘ç§»å‹•' ELSE TRUE END)
+`;
+
+    const sqlSummary = `
+      WITH params AS (
+        SELECT
+          ($1)::date AS m,
+          $2::text   AS seg,
+          $3::text   AS cur,
+          $4::boolean AS ex
+      ),
+      curr AS (
+        SELECT
+          COALESCE(SUM(CASE WHEN m.flow_type='IN'  THEN m.jpy_amount END),0) AS in_jpy,
+          COALESCE(SUM(CASE WHEN m.flow_type='OUT' THEN m.jpy_amount END),0) AS out_jpy
+        FROM app.manual_entry m
+        LEFT JOIN app.manual_entry_category c ON c.id = m.category_id, params p
+        WHERE date_trunc('month', m.trade_date) = date_trunc('month', p.m)
+          AND (p.seg = 'total' OR m.segment = p.seg::app.segment_type)
+          AND (p.cur = 'ALL' OR m.currency = p.cur)
+          AND (CASE WHEN p.ex THEN COALESCE(c.category_name,'') <> 'è³‡é‡‘ç§»å‹•' ELSE TRUE END)
+      ),
+      prev AS (
+        SELECT
+          COALESCE(SUM(CASE WHEN m.flow_type='IN'  THEN m.jpy_amount END),0) AS in_jpy,
+          COALESCE(SUM(CASE WHEN m.flow_type='OUT' THEN m.jpy_amount END),0) AS out_jpy
+        FROM app.manual_entry m
+        LEFT JOIN app.manual_entry_category c ON c.id = m.category_id, params p
+        WHERE date_trunc('month', m.trade_date) = date_trunc('month', p.m - INTERVAL '1 month')
+          AND (p.seg = 'total' OR m.segment = p.seg::app.segment_type)
+          AND (p.cur = 'ALL' OR m.currency = p.cur)
+          AND (CASE WHEN p.ex THEN COALESCE(c.category_name,'') <> 'è³‡é‡‘ç§»å‹•' ELSE TRUE END)
+      )
+      SELECT
+        curr.in_jpy AS in_jpy,
+        curr.out_jpy AS out_jpy,
+        (curr.in_jpy - curr.out_jpy) AS total_jpy,
+        prev.in_jpy AS prev_in_jpy,
+        prev.out_jpy AS prev_out_jpy,
+        (prev.in_jpy - prev.out_jpy) AS prev_total_jpy
+      FROM curr, prev;
+    `;
+
+    const { rows } = await pool.query(listSql, params);
+    const { rows: sumRows } = await pool.query(sqlSummary, params);
+
+    const s = sumRows[0] || {
+      in_jpy: 0,
+      out_jpy: 0,
+      total_jpy: 0,
+      prev_in_jpy: 0,
+      prev_out_jpy: 0,
+      prev_total_jpy: 0,
+    };
+
+    const summary = {
+      in_jpy: Number(s.in_jpy),
+      out_jpy: Number(s.out_jpy),
+      total_jpy: Number(s.total_jpy ?? Number(s.in_jpy) - Number(s.out_jpy)),
+      prev_total_jpy: Number(s.prev_total_jpy),
+      mom_diff_jpy:
+        Number(s.total_jpy ?? Number(s.in_jpy) - Number(s.out_jpy)) -
+        Number(s.prev_total_jpy),
+    };
+
+    return res.json({
+      month,
+      segment,
+      currency,
+      exclude_transfer: excludeTransfer,
+      rows,
+      summary,
+    });
+  } catch (e) {
+    console.error("[manual-entry] error:", e);
+    return res.status(500).json({ error: "internal" });
+  }
+});
+
+
+async function upsertFiatMonthAverages(ym, symbols) {
+  if (!symbols || symbols.length === 0) return { ym, ok: true, upserted: [] };
+
+  const avgJpyBase = await fetchFiatDailyJpyBase(ym, symbols);
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const upserted = [];
+    for (const ccy of symbols) {
+      const vJpyBase = avgJpyBase[ccy];
+      if (!Number.isFinite(vJpyBase) || vJpyBase <= 0) continue;
+      const jpyPerUnit = 1 / vJpyBase;
+      await client.query(
+        `INSERT INTO app.fx_rate_monthly (currency, month_start, rate_month_avg, rate_ttm)
+         VALUES ($1, $2::date, $3::numeric, $3::numeric)
+         ON CONFLICT (currency, month_start)
+         DO UPDATE SET rate_month_avg = EXCLUDED.rate_month_avg, rate_ttm = EXCLUDED.rate_ttm`,
+        [ccy, `${ym}-01`, jpyPerUnit]
+      );
+      upserted.push(ccy);
+    }
+    await client.query("COMMIT");
+    return { ym, ok: true, upserted };
+  } catch (e) {
+    await client.query("ROLLBACK");
+    console.error("[upsertFiatMonthAverages] failed:", e);
+    return { ym, ok: false, error: e.message };
+  } finally {
+    client.release();
+  }
+}
+
+async function fetchCryptoUsdDaily(ym, id) {
+  const { start, end } = monthRange(ym);
+  const url = `https://api.coingecko.com/api/v3/coins/${id}/market_chart/range?vs_currency=usd&from=${Math.floor(start.getTime()/1000)}&to=${Math.floor(end.getTime()/1000)}`;
+  const r = await fetch(url, { headers: { accept: "application/json" } });
+  if (!r.ok) throw new Error(`CG daily fetch failed: ${id} ${r.status}`);
+  const j = await r.json();
+  const prices = Array.isArray(j.prices) ? j.prices : [];
+  const inMonth = prices
+    .map(([ts, price]) => ({ ts: new Date(ts), price: Number(price) }))
+    .filter((p) => p.ts >= start && p.ts <= end)
+    .map((p) => p.price)
+    .filter((n) => Number.isFinite(n));
+  return inMonth;
+}
+
+const COINGECKO_IDS = { BTC: "bitcoin", ETH: "ethereum" };
+
+async function upsertCryptoMonthAverages(ym, symbols) {
+  if (!symbols || symbols.length === 0) return { ym, ok: true, upserted: [] };
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const upserted = [];
+    for (const sym of symbols) {
+      const id = COINGECKO_IDS[sym];
+      if (!id) {
+        console.warn("[sync] unknown crypto symbol", sym);
+        continue;
+      }
+      const d = await fetchCryptoUsdDaily(ym, id);
+      const mAvg = avg(d);
+      if (mAvg && Number.isFinite(mAvg)) {
+        await client.query(
+          `INSERT INTO app.crypto_usd_monthly (symbol, month_start, usd_month_avg)
+           VALUES ($1, $2::date, $3::numeric)
+           ON CONFLICT (symbol, month_start)
+           DO UPDATE SET usd_month_avg = EXCLUDED.usd_month_avg`,
+          [sym, `${ym}-01`, mAvg]
+        );
+        upserted.push(sym);
+      }
+    }
+    await client.query("COMMIT");
+    return { ym, ok: true, upserted };
+  } catch (e) {
+    await client.query("ROLLBACK");
+    console.error("[upsertCryptoMonthAverages] failed:", e);
+    return { ym, ok: false, error: e.message };
+  } finally {
+    client.release();
+  }
+}
+
+async function syncMonthRates(ym) {
+  const uni = await getCurrencyUniverse();
+  const fiatTargets = uni.fiat.filter((c) => c !== "JPY");
+  const cryptoTargets = uni.crypto;
+
+  const rFiat = await upsertFiatMonthAverages(ym, fiatTargets);
+  const rCrypto = await upsertCryptoMonthAverages(ym, cryptoTargets);
+
+  return { ym, ok: true, universe: uni, fiat: rFiat, crypto: rCrypto };
+}
+
+function resolveTargetMonths(qMonth) {
+  if (qMonth && /^\d{4}-\d{2}$/.test(qMonth)) return [qMonth];
+  const now = new Date();
+  const y = now.getUTCFullYear();
+  const m = now.getUTCMonth() + 1;
+  const ymNow = `${y}-${String(m).padStart(2, "0")}`;
+  const prev = new Date(Date.UTC(y, m - 2, 1));
+  const ymPrev = `${prev.getUTCFullYear()}-${String(prev.getUTCMonth() + 1).padStart(2, "0")}`;
+  return [ymPrev, ymNow];
+}
+
+app.post("/admin/rates/sync", async (req, res) => {
+  try {
+    const qMonth = (req.query.month || "").toString().trim();
+    const months = resolveTargetMonths(qMonth);
+    const results = [];
+    for (const ym of months) results.push(await syncMonthRates(ym));
+    res.json({ status: "ok", results });
+  } catch (e) {
+    console.error("[admin/rates/sync] error", e);
+    res.status(500).json({ error: e.message || "sync_failed" });
+  }
+});
+
+cron.schedule(
+  "10 19 * * *",
+  async () => {
+    try {
+      const months = resolveTargetMonths(null);
+      console.log("[CRON] rates sync start", months);
+      for (const ym of months) {
+        const r = await syncMonthRates(ym);
+        console.log("[CRON] sync result", r);
+      }
+      console.log("[CRON] rates sync done");
+    } catch (e) {
+      console.error("[CRON] rates sync failed", e);
+    }
+  },
+  { scheduled: true, timezone: "UTC" }
+);
+
+
+
+app.get('/api/admin/users', async (req, res) => {
+  try {
+    const sql = `
+      SELECT
+        id,
+        name,
+        email,
+        role,
+        to_char(last_login,'YYYY-MM-DD HH24:MI') AS "lastLogin"
+      FROM app.users
+      ORDER BY id
+    `;
+    const { rows } = await pool.query(sql);
+    res.json({ rows: rows || [] });
+  } catch (e) {
+    console.error('[admin/users] error', e);
+    res.status(500).json({ error: 'admin users fetch failed' });
+  }
+});
+
+app.post('/api/admin/users', async (req, res) => {
+  try {
+    const { name, email, role = 'viewer', mfaEnabled = false, active = true } = req.body || {};
+    if (!name || !email) return res.status(400).json({ error: 'name/email required' });
+
+    const sql = `
+      INSERT INTO app.users (name, email, role, mfa_enabled, active, last_login)
+      VALUES ($1, $2, $3, $4, $5, NULL)
+      RETURNING
+        id, name, email, role,
+        mfa_enabled AS "mfaEnabled",
+        active,
+        to_char(last_login,'YYYY-MM-DD HH24:MI') AS "lastLogin"
+    `;
+    const { rows } = await pool.query(sql, [name, email, role, !!mfaEnabled, !!active]);
+    res.json(rows[0]);
+  } catch (e) {
+    console.error('[admin/users POST] error', e);
+    res.status(500).json({ error: 'admin users create failed' });
+  }
+});
+
+app.put('/api/admin/users/:id', async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const { name, email, role, mfaEnabled, active } = req.body || {};
+    const sql = `
+      UPDATE app.users
+      SET
+        name        = COALESCE($1, name),
+        email       = COALESCE($2, email),
+        role        = COALESCE($3, role),
+        mfa_enabled = COALESCE($4, mfa_enabled),
+        active      = COALESCE($5, active)
+      WHERE id = $6
+      RETURNING
+        id, name, email, role,
+        mfa_enabled AS "mfaEnabled",
+        active,
+        to_char(last_login,'YYYY-MM-DD HH24:MI') AS "lastLogin"
+    `;
+    const vals = [
+      name ?? null,
+      email ?? null,
+      role ?? null,
+      typeof mfaEnabled === 'boolean' ? mfaEnabled : null,
+      typeof active === 'boolean' ? active : null,
+      id
+    ];
+    const { rows } = await pool.query(sql, vals);
+    if (rows.length === 0) return res.status(404).json({ error: 'not found' });
+    res.json(rows[0]);
+  } catch (e) {
+    console.error('[admin/users PUT] error', e);
+    res.status(500).json({ error: 'admin users update failed' });
+  }
+});
+
+app.delete('/api/admin/users/:id', async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    await pool.query('DELETE FROM app.users WHERE id=$1', [id]);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('[admin/users DELETE] error', e);
+    res.status(500).json({ error: 'admin users delete failed' });
+  }
+});
+
+let adminSettings = { rateMode: 'avg', autoAggregation: true };
+
+app.get('/api/admin/settings', (req, res) => {
+  try {
+    res.json(adminSettings);
+  } catch (e) {
+    res.status(500).json({ error: 'settings fetch failed' });
+  }
+});
+
+app.put('/api/admin/settings', async (req, res) => {
+  try {
+    const { rateMode, autoAggregation } = req.body || {};
+    if (rateMode && ['avg', 'trade', 'ttm'].includes(rateMode)) {
+      adminSettings.rateMode = rateMode;
+    }
+    if (typeof autoAggregation === 'boolean') {
+      adminSettings.autoAggregation = autoAggregation;
+    }
+    res.json(adminSettings);
+  } catch (e) {
+    res.status(500).json({ error: 'settings update failed' });
+  }
+});
+
+app.get('/api/rates', async (req, res) => {
+  const year = Number(req.query.year || new Date().getFullYear());
+  const symbols = String(req.query.symbols || 'USD,AED,NTD,EUR')
+    .split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
+
+  const months = Array.from({ length: 12 }, (_, i) => ({ month: `${i + 1}æœˆ` }));
+
+  try {
+    const sql = `
+      SELECT year, month, UPPER(symbol) AS symbol, rate
+      FROM app.fx_rate_monthly
+      WHERE year = $1 AND symbol = ANY($2)
+    `;
+    const { rows } = await pool.query(sql, [year, symbols]);
+
+    const map = new Map();
+    for (const r of rows) {
+      const m = Number(r.month);
+      if (!map.has(m)) map.set(m, {});
+      map.get(m)[r.symbol] = Number(r.rate);
+    }
+    for (let i = 1; i <= 12; i++) {
+      Object.assign(months[i - 1], map.get(i) || {});
+    }
+    return res.json(months);
+  } catch (e) {
+    console.warn('[rates] fallback empty:', e.message || e);
+    return res.json(months);
+  }
+});
+app.listen(PORT, () => {
+  console.log(`Rates API listening on http://localhost:${PORT}`);
+});
