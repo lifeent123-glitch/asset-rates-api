@@ -1618,25 +1618,77 @@ async function fetchCryptoUsdDaily(ym, id) {
 
   // 3回とも429だった場合
   throw new Error(`CG daily fetch failed: ${id} 429`);
-}  // ← ここで関数を閉じる！
+}  // ← ここで fetchCryptoUsdDaily 関数を閉じる！
 
-// 関数の外に定義
+// ===== CoinGecko 用 ID マッピング =====
 const COINGECKO_IDS = { BTC: "bitcoin", ETH: "ethereum" };
+
+/**
+ * CoinGecko 向けのリトライ付きラッパー
+ * - 429 や一時的なネットワークエラー時に指数バックオフでリトライ
+ * - 最終的に失敗した場合は、元のエラーをそのまま投げる（既存ロジックと整合）
+ */
+async function fetchCryptoUsdDailyWithRetry(ym, id, maxRetries = 3) {
+  let attempt = 0;
+  let lastError;
+
+  while (attempt < maxRetries) {
+    attempt += 1;
+    try {
+      // 既存の実装をそのまま利用
+      return await fetchCryptoUsdDaily(ym, id);
+    } catch (e) {
+      lastError = e;
+      const msg = e?.message || String(e);
+
+      // 429 か、一時的なネットワーク系エラーだけリトライ対象にする
+      const is429 = msg.includes("429");
+      const isTransient =
+        msg.includes("ECONNRESET") ||
+        msg.includes("ETIMEDOUT") ||
+        msg.includes("ENOTFOUND") ||
+        msg.includes("EAI_AGAIN");
+
+      if (attempt >= maxRetries || (!is429 && !isTransient)) {
+        // これ以上リトライしない / 永続的エラー → そのまま投げる
+        console.error(
+          `[fetchCryptoUsdDailyWithRetry] giving up id=${id} ym=${ym} attempt=${attempt} msg=${msg}`
+        );
+        throw e;
+      }
+
+      // バックオフして再試行
+      const delayMs = 500 * Math.pow(2, attempt - 1); // 500ms → 1000ms → 2000ms
+      console.warn(
+        `[fetchCryptoUsdDailyWithRetry] retry id=${id} ym=${ym} attempt=${attempt}/${maxRetries} delay=${delayMs}ms msg=${msg}`
+      );
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+
+  // 通常ここには来ないはずだが、型安全のため
+  throw lastError || new Error(`CG daily fetch failed (unknown error): ${id} ${ym}`);
+}
 
 async function upsertCryptoMonthAverages(ym, symbols) {
   if (!symbols || symbols.length === 0) return { ym, ok: true, upserted: [] };
+
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
     const upserted = [];
+
     for (const sym of symbols) {
       const id = COINGECKO_IDS[sym];
       if (!id) {
         console.warn("[sync] unknown crypto symbol", sym);
         continue;
       }
-      const d = await fetchCryptoUsdDaily(ym, id);
+
+      // ★ ここだけ fetchCryptoUsdDaily → fetchCryptoUsdDailyWithRetry に変更
+      const d = await fetchCryptoUsdDailyWithRetry(ym, id);
       const mAvg = avg(d);
+
       if (mAvg && Number.isFinite(mAvg)) {
         await client.query(
           `INSERT INTO app.crypto_usd_monthly (symbol, month_start, usd_month_avg)
@@ -1648,6 +1700,7 @@ async function upsertCryptoMonthAverages(ym, symbols) {
         upserted.push(sym);
       }
     }
+
     await client.query("COMMIT");
     return { ym, ok: true, upserted };
   } catch (e) {

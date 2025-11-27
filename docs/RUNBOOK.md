@@ -14,7 +14,7 @@
 
 ## 3. API起動（ローカル検証）
 - DATABASE_URL（assetapp）で起動：
-  DATABASE_URL='postgres://assetapp:***@127.0.0.1:15432/assetdb' \
+  DATABASE_URL='postgres://assetapp:AppUser#2025!Secure@127.0.0.1:15432/assetdb' \
   NODE_TLS_REJECT_UNAUTHORIZED=0 node rates-api.js
 
 ## 4. /api の仕様差分（2025-10-02）
